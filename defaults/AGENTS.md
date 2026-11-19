@@ -556,6 +556,9 @@ shortcuts must then be added by hand.
   has focus. Clicking the terminal puts typing, including Escape, back in the program;
   the bar and its matches stay.
   Each terminal keeps its own query, and reopening selects it so typing replaces it. Search covers the screen and scrollback without replacing text selection.
+- Copy mode: `ctrl-shift-space` (`mod.open:copy-mode`, every platform) moves a cursor over the
+  focused terminal with vi keys and selects from the keyboard. Esc drops a selection; the same
+  key, q, Ctrl+C or Esc without a selection leave.
 
 ## Commands
 
@@ -639,7 +642,18 @@ The main ones:
   `terminal.adjust_selection {terminal?, direction}` (left, right, up, down, page_up, page_down,
   home, end, line_start, line_end; moves the selection's end and follows it in the view;
   fails with no selection), `terminal.clear_selection {terminal?}`.
-  These default to the focused terminal, like scroll, and add no default keys or copy mode.
+  `terminal.set_selection {terminal?, start, end, rectangle?}` (both ends `{row, col}`, inclusive;
+  `rectangle: true` selects a block), `terminal.set_cursor {terminal?, at?: {row, col} | "cursor" | null}`
+  (copy mode's cursor, drawn in place of the program's and scrolled into view; while it shows, output
+  doesn't move the view and the cursor stays on its text; `null` removes it, as does a program
+  switching screens). These default to the focused terminal, like scroll.
+  `terminalRows(terminal, from, count)` reads rows as cells right now: each cell's `text` is a
+  whole grapheme cluster, `""` for blanks and for the second half of a wide character (the cell
+  before has `wide: true`); `wrapped` says the line goes on in the next row. It also gives `total`,
+  the view's `top` and `height`, the `cursor` and the `selection`.
+  The shipped `copy-mode` mod (`mod.open:copy-mode`, Ctrl+Shift+Space) uses them: vi keys
+  (hjkl, w/b/e/W/B/E, 0 ^ $, gg G, H M L, Ctrl+U/D/B/F/Y/E, counts), v or Space, V and
+  Ctrl+V select characters, lines or a block, y or Enter copies and leaves, q or Esc leaves.
   `terminal.copy` copies the focused terminal's selection. `terminals()` and `focused()` expose
   `selection: {start: {row, col}, end: {row, col}} | null` when the selection changes.
   Start at the cursor with `terminal.select`; use `selection.end` as a copy-mode cursor.

@@ -559,6 +559,8 @@ thread_local! {
     /// re-render when they change.
     static SNAPSHOT: RefCell<Snapshot> = RefCell::new(Snapshot::default());
     static PANE_VIEWS: RefCell<HashMap<String, gpui::WeakEntity<crate::terminal::TerminalView>>> = RefCell::new(HashMap::new());
+    /// Every terminal view, panes or not (peeks, floats, overlay windows): what `terminalRows` reads.
+    static TERMINAL_VIEWS: RefCell<Vec<gpui::WeakEntity<crate::terminal::TerminalView>>> = const { RefCell::new(Vec::new()) };
     static AGENT_ORDER: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static SHARED: RefCell<Option<SharedStore>> = const { RefCell::new(None) };
     /// Where key commands for each loaded copy go: (copy, mod, sender).
@@ -625,6 +627,10 @@ pub fn panes_scrolled() {
 
 pub fn track_pane_view(pane: String, view: &gpui::Entity<crate::terminal::TerminalView>) {
     PANE_VIEWS.with_borrow_mut(|views| { views.insert(pane, view.downgrade()); });
+    TERMINAL_VIEWS.with_borrow_mut(|views| {
+        views.retain(|v| v.upgrade().is_some());
+        views.push(view.downgrade());
+    });
 }
 
 pub fn publish_panes(v: Value) -> bool {
@@ -729,6 +735,18 @@ fn read(reads: &RefCell<LiveReads>, key: &'static str, f: impl FnOnce(&Snapshot)
         });
         to_host(&panes)
     })
+}
+
+/// `terminalRows`: read from the terminal view at call time, not the published snapshot,
+/// so commands already applied show. The view with a copy cursor wins, then the one on screen.
+fn terminal_rows(address: &str, from: u32, count: u32) -> Value {
+    gpui_shell::with_current_app(|cx| {
+        TERMINAL_VIEWS.with_borrow(|views| {
+            views.iter().filter_map(|v| v.upgrade()).filter(|v| v.read(cx).address == address)
+                .max_by_key(|v| (v.read(cx).has_copy_cursor(), v.read(cx).on_screen_this_frame()))
+                .map(|v| v.read(cx).text_rows(from, count))
+        })
+    }).flatten().unwrap_or(Value::Null)
 }
 
 fn reader(reads: Rc<RefCell<LiveReads>>, key: &'static str, f: fn(&Snapshot) -> &Value) -> impl Fn(&gpui_shell::HostArguments) -> gpui_shell::HostResult {
@@ -1145,6 +1163,10 @@ fn module(inst: Instance, copy: u64) -> HostModule {
         })
         .function("terminals", reader(reads.clone(), "terminals", |s| &s.terminals))
         .function("focused", reader(reads.clone(), "focused", |s| &s.focused))
+        .function("terminalRows", |a| {
+            let row = |i: usize| a.integer(i).ok().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| HostError::new("terminalRows(terminal, from, count): from and count are nonnegative whole numbers"));
+            Ok(to_host(&terminal_rows(a.string(0)?, row(1)?, row(2)?.min(1000))))
+        })
         .function("layout", reader(reads.clone(), "layout", |s| &s.layout))
         .function("layouts", |_| Ok(to_host(&json!(crate::window::layout_names()))))
         .function("commands", |_| {

@@ -320,6 +320,26 @@ Clear a terminal's selection (default: the focused one).
 |---|---|
 | `terminal` | no |
 
+## `terminal.set_selection`
+
+Select from cell start to cell end, both {row, col} and inclusive, replacing the selection (default: the focused terminal). rectangle: true takes the same columns on every row, as a block. For a copy mode that moves the ends itself; read cells with terminalRows.
+
+| Argument | Required |
+|---|---|
+| `terminal` | no |
+| `start` | yes |
+| `end` | yes |
+| `rectangle` | no |
+
+## `terminal.set_cursor`
+
+Show a copy-mode cursor on a cell (at: {row, col}, default "cursor", the program's), in place of the program's cursor, and scroll it into view (default: the focused terminal). While it shows, output doesn't move the view, and the cursor stays on its text. at: null removes it; a program switching screens removes it too.
+
+| Argument | Required |
+|---|---|
+| `terminal` | no |
+| `at` | no |
+
 ## `terminal.copy`
 
 Copy the focused terminal's selection. With nothing selected, that key goes to the program.

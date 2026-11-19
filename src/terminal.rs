@@ -822,6 +822,21 @@ impl TerminalView {
         self.grid.borrow().vt.selection_positions()
     }
 
+    /// Rows as cells with the view, the copy cursor and the selection, read at call time.
+    pub fn text_rows(&self, from: u32, count: u32) -> serde_json::Value {
+        let g = self.grid.borrow();
+        let sb = g.vt.scrollbar();
+        serde_json::json!({
+            "total": sb.total, "top": sb.offset, "height": sb.len,
+            "cursor": g.vt.copy_cursor(), "selection": g.vt.selection_positions(),
+            "rows": g.vt.text_rows(from, count),
+        })
+    }
+
+    pub fn has_copy_cursor(&self) -> bool {
+        self.grid.borrow().vt.copy_cursor().is_some()
+    }
+
     fn selection_changed(&mut self, cx: &mut Context<Self>) {
         let selection = self.selection();
         if selection != self.published_selection {
@@ -851,6 +866,22 @@ impl TerminalView {
                 grid.vt.adjust_selection(direction)?;
             }
             "terminal.clear_selection" => grid.vt.clear_selection(),
+            "terminal.set_selection" => {
+                let cell = |key: &str| args.get(key).and_then(|v| serde_json::from_value::<vt::CellPosition>(v.clone()).ok())
+                    .ok_or("terminal.set_selection start and end are {row, col} with nonnegative whole numbers");
+                let rectangle = match args.get("rectangle") {
+                    None => false,
+                    Some(value) => value.as_bool().ok_or("terminal.set_selection rectangle is true or false")?,
+                };
+                grid.vt.set_selection(cell("start")?, cell("end")?, rectangle)?;
+            }
+            "terminal.set_cursor" => match args.get("at") {
+                Some(serde_json::Value::Null) => grid.vt.clear_copy_cursor(),
+                None => grid.vt.set_copy_cursor(None)?,
+                Some(value) if value.as_str() == Some("cursor") => grid.vt.set_copy_cursor(None)?,
+                Some(value) => grid.vt.set_copy_cursor(Some(serde_json::from_value::<vt::CellPosition>(value.clone())
+                    .map_err(|_| "terminal.set_cursor at is cursor, null or {row, col} with nonnegative whole numbers")?))?,
+            },
             _ => unreachable!(),
         }
         drop(grid);
@@ -2260,7 +2291,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
         let w = cell.width * if wide { 2.0 } else { 1.0 };
         let color = hsla(cur.color);
         let p = at(x, y);
-        match (focused, cur.shape) {
+        match (focused || cur.copy, cur.shape) {
             (true, CursorShape::Block) => {
                 window.paint_quad(fill(snap_box(Bounds::new(p, size(w, cell.height))), color));
                 if let Some(c) = frame.rows.get(y).and_then(|r| r.get(x)).filter(|c| !c.text.is_empty()) {

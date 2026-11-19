@@ -55,6 +55,7 @@
     "ctrl-shift-e": "pane.split:down",
     "ctrl-shift-w": "tab.close",
     "ctrl-shift-x": "pane.close",
+    "ctrl-shift-space": "mod.open:copy-mode",
     "ctrl-shift-z": "pane.zoom",
     "ctrl-shift-l": "layout.switch",
     "f2": "tab.rename",

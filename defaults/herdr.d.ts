@@ -71,7 +71,11 @@ export function playSound(sound: string): null;
  *   terminal.show {terminal?, pane?} (shown in the pane for now, in place of its own), terminal.copy, terminal.paste,
  *   terminal.select {terminal?, at?: {row, col} | "cursor", mode?: "cell" | "word" | "line"} (replaces the selection; defaults to cursor and cell).
  *   terminal.adjust_selection {terminal?, direction: "left" | "right" | "up" | "down" | "page_up" | "page_down" | "home" | "end" | "line_start" | "line_end"} (moves the inclusive moving end; view follows; fails without selection).
- *   terminal.clear_selection {terminal?}. No default keys or built-in copy mode.
+ *   terminal.clear_selection {terminal?}.
+ *   terminal.set_selection {terminal?, start: {row, col}, end: {row, col}, rectangle?: boolean} (both ends inclusive; rectangle: a block).
+ *   terminal.set_cursor {terminal?, at?: {row, col} | "cursor" | null} (copy mode's cursor in place of the program's; while it shows,
+ *   output doesn't move the view and the cursor stays on its text; null removes it, as does a program switching screens).
+ *   The shipped copy-mode mod (mod.open:copy-mode, Ctrl+Shift+Space) is built on these and terminalRows.
  *   terminal.select_all {terminal?} (whole screen and scrollback, or only the alternate screen; Cmd+A on macOS).
  *   terminal.right_click {to: "program" | "menu", terminal?} (right-clicks to a program that takes the mouse; Shift: the menu).
  *   terminal.scroll {lines | pages | to: "top" | "bottom", terminal?} (Herdr's view of the history: negative goes up; pages may be fractional).
@@ -266,6 +270,19 @@ export interface TerminalSelectionState {
  *  `shown`: terminal.show replacement, if any. `agent`: the agent an agent block shows.
  *  `terminal` is null for mod panes. Selection describes the terminal that receives
  *  terminal commands (including a shown replacement or peek). Live. */
+/** A terminal's rows as copy mode reads them, from its pane's view, read now (not a snapshot):
+ *  `count` rows (at most 1000) from row `from`, rows counted as in TerminalCell. Each cell's `text`
+ *  is its whole grapheme cluster (emoji sequences too), "" for a blank cell and for the second half
+ *  of a wide character (the cell before it has `wide`). `wrapped`: the line goes on in the next row.
+ *  `total` rows, the view's first row `top` and `height`, the terminal.set_cursor `cursor` and the
+ *  selection come along; pass count 0 for those alone. Null when no pane shows the terminal. */
+export function terminalRows(terminal: string, from: number, count: number): {
+  total: number; top: number; height: number;
+  cursor: TerminalCell | null;
+  selection: { start: TerminalCell; end: TerminalCell } | null;
+  rows: { cells: { text: string; wide: boolean }[]; wrapped: boolean }[];
+} | null;
+
 export function focused(): ({ space: string; tab: string; pane: string | null; terminal: string | null; shown: string | null; agent: string | null; cwd: string | null } & TerminalSelectionState) | null;
 
 /** The shown layout (layouts/<name>.json). Its name is shared("layout").
