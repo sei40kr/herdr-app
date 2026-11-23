@@ -8,6 +8,7 @@
     "cmd-w": "tab.close",
     "ctrl-tab": "tab.next",
     "ctrl-shift-tab": "tab.prev",
+    "ctrl-shift-space": "mod.open:copy-mode",
     "cmd-shift-]": "tab.next",
     "cmd-shift-[": "tab.prev",
     "cmd-alt-]": "space.next",

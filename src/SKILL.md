@@ -100,8 +100,8 @@ page_down, home, end, line_start, line_end. It fails without a selection.
 `terminal.set_selection {terminal?, start, end, rectangle?}` installs a selection between two
 inclusive cells (`rectangle: true` for a block). `terminal.set_cursor {terminal?, at?: {row, col} |
 "cursor" | null}` shows copy mode's cursor in place of the program's; while it shows, output doesn't
-move the view and the cursor stays on its text; `null` removes it.
-These add no default keys or built-in copy mode. Mods read the inclusive selection
+move the view and the cursor stays on its text; `null` removes it. Ctrl+Shift+Space opens the shipped
+copy mode (vi keys; v, V and Ctrl+V select; y copies). Mods read the inclusive selection
 endpoints from `focused().selection` or `terminals()`; null means none (or no
 attached view). Use `selection.end` as a copy-mode cursor. Selection facts update
 when the selection changes, without refreshing readers on ordinary terminal output.
