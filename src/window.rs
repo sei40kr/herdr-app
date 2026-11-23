@@ -3498,7 +3498,7 @@ impl AppWindow {
                 }
                 return;
             }
-            "terminal.select" | "terminal.adjust_selection" | "terminal.clear_selection" => {
+            "terminal.select" | "terminal.adjust_selection" | "terminal.clear_selection" | "terminal.set_selection" | "terminal.set_cursor" => {
                 let view = match Self::owned(a, "terminal") {
                     Some(address) => self.shown_terminal_view(&address, window, cx),
                     None => self.focused_terminal(window, cx).map(|t| t.view.clone()).ok_or_else(|| "no focused terminal to select".into()),

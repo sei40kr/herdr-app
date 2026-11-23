@@ -21,6 +21,36 @@ pub struct SelectionPositions {
     pub end: CellPosition,
 }
 
+/// `text` is the cell's whole grapheme cluster, empty for a blank cell and for
+/// the second half of a wide character.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct TextCell {
+    pub text: String,
+    pub wide: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct TextRow {
+    pub cells: Vec<TextCell>,
+    /// The line goes on in the next row (the terminal wrapped it).
+    pub wrapped: bool,
+}
+
+/// Copy mode's cursor and the view's first row as tracked references: they
+/// stay on their text while output arrives or history is pruned.
+struct CopyCursor {
+    at: GhosttyTrackedGridRef,
+    top: Option<GhosttyTrackedGridRef>,
+    /// The screen it was put on: tracked references don't cross screens.
+    alt: bool,
+}
+
+fn tracked_point(tracked: GhosttyTrackedGridRef, tag: GhosttyPointTag) -> Option<CellPosition> {
+    let mut point = GhosttyPointCoordinate::default();
+    (unsafe { ghostty_tracked_grid_ref_point(tracked, tag, &mut point) } == GHOSTTY_SUCCESS)
+        .then_some(CellPosition { row: point.y, col: point.x })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
@@ -124,6 +154,8 @@ pub struct Cursor {
     pub y: u16,
     pub shape: CursorShape,
     pub color: Rgb,
+    /// Copy mode's cursor: drawn solid even when the terminal doesn't have the keyboard.
+    pub copy: bool,
 }
 
 pub struct Frame {
@@ -533,6 +565,7 @@ pub struct Vt {
     placements_cache: RefCell<Option<Vec<Placement>>>,
     /// Whether the program wants win32 key events (Ghostty doesn't track it).
     pub win32: crate::win32_keys::Win32Input,
+    copy: Option<CopyCursor>,
 }
 
 /// What of the cursor a frame shows: (on screen, x, y, visible, style).
@@ -626,14 +659,22 @@ fn hyperlink_uri(r: &GhosttyGridRef) -> Option<String> {
     (res == GHOSTTY_SUCCESS && len > 0).then(|| String::from_utf8_lossy(&buf[..len]).into_owned())
 }
 
-fn is_wide(r: &GhosttyGridRef) -> bool {
+fn cell_width(r: &GhosttyGridRef) -> Option<GhosttyCellWide> {
     let mut cell: GhosttyCell = Default::default();
     let mut wide: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW;
     let read = unsafe {
         ghostty_grid_ref_cell(r, &mut cell) == GHOSTTY_SUCCESS
             && ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &mut wide as *mut _ as *mut c_void) == GHOSTTY_SUCCESS
     };
-    read && wide == GHOSTTY_CELL_WIDE_WIDE
+    read.then_some(wide)
+}
+
+fn is_wide(r: &GhosttyGridRef) -> bool {
+    cell_width(r) == Some(GHOSTTY_CELL_WIDE_WIDE)
+}
+
+fn is_spacer_tail(r: &GhosttyGridRef) -> bool {
+    cell_width(r) == Some(GHOSTTY_CELL_WIDE_SPACER_TAIL)
 }
 
 #[derive(Clone, Copy)]
@@ -771,6 +812,7 @@ impl Vt {
                 seen_with: (0, 0),
                 placements_cache: RefCell::new(None),
                 win32: Default::default(),
+                copy: None,
             };
             vt.apply_theme();
             vt
@@ -1137,14 +1179,135 @@ impl Vt {
         // Convert before installing the snapshot: any mutating call invalidates its refs.
         let end = self.cell_position(&selection.end).ok_or("selection end is outside the screen")?;
         unsafe { ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, &selection as *const _ as *const c_void); }
+        self.follow(end.row);
+        Ok(())
+    }
+
+    /// Scrolls the least that shows screen row `row`.
+    fn follow(&mut self, row: u32) {
         let scrollbar = self.scrollbar();
-        let row = u64::from(end.row);
+        let row = u64::from(row);
         if row < scrollbar.offset {
             self.scroll_to_row(row as usize);
         } else if row >= scrollbar.offset.saturating_add(scrollbar.len) {
             self.scroll_to_row(row.saturating_sub(scrollbar.len.saturating_sub(1)) as usize);
         }
+    }
+
+    /// Installs a selection between two cells; `rectangle` takes the same columns on every row.
+    pub fn set_selection(&mut self, start: CellPosition, end: CellPosition, rectangle: bool) -> Result<(), String> {
+        let outside = "terminal.set_selection start and end are cells of the screen and history";
+        let start = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, start.col, start.row).ok_or(outside)?;
+        let end = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, end.col, end.row).ok_or(outside)?;
+        let selection = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), start, end, rectangle, ..Default::default() };
+        unsafe { ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, &selection as *const _ as *const c_void); }
         Ok(())
+    }
+
+    fn track(&self, col: u16, row: u32) -> Option<GhosttyTrackedGridRef> {
+        let mut point = GhosttyPoint { tag: GHOSTTY_POINT_TAG_SCREEN, ..Default::default() };
+        point.value.coordinate = GhosttyPointCoordinate { x: col, y: row };
+        let mut tracked: GhosttyTrackedGridRef = std::ptr::null_mut();
+        (unsafe { ghostty_terminal_grid_ref_track(self.term, point, &mut tracked) } == GHOSTTY_SUCCESS).then_some(tracked)
+    }
+
+    /// Puts copy mode's cursor on a cell (the program's cursor by default) and
+    /// shows it. While it's there, output doesn't move the view.
+    pub fn set_copy_cursor(&mut self, at: Option<CellPosition>) -> Result<(), String> {
+        let at = at.unwrap_or_else(|| self.cursor_position());
+        let reference = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, at.col, at.row).ok_or("terminal.set_cursor at is outside the screen and history")?;
+        // A cell in the second half of a wide character means the character.
+        let col = if is_spacer_tail(&reference) { at.col.saturating_sub(1) } else { at.col };
+        self.clear_copy_cursor();
+        let cursor = self.track(col, at.row).ok_or("terminal.set_cursor could not hold that cell")?;
+        self.copy = Some(CopyCursor { at: cursor, top: None, alt: self.alt_screen() });
+        self.follow(at.row);
+        self.remember_top();
+        Ok(())
+    }
+
+    pub fn clear_copy_cursor(&mut self) {
+        if let Some(copy) = self.copy.take() {
+            unsafe {
+                ghostty_tracked_grid_ref_free(copy.at);
+                if let Some(top) = copy.top {
+                    ghostty_tracked_grid_ref_free(top);
+                }
+            }
+        }
+    }
+
+    /// Copy mode's cursor, on the text it was put on even after output or pruned history moved it.
+    pub fn copy_cursor(&self) -> Option<CellPosition> {
+        tracked_point(self.copy.as_ref()?.at, GHOSTTY_POINT_TAG_SCREEN)
+    }
+
+    /// The view's first row, kept on its text so output can't scroll the view.
+    fn remember_top(&mut self) {
+        let Some(copy) = &self.copy else { return };
+        if let Some(top) = copy.top {
+            unsafe { ghostty_tracked_grid_ref_free(top) };
+        }
+        let top = self.track(0, self.scrollbar().offset as u32);
+        if let Some(copy) = &mut self.copy {
+            copy.top = top;
+        }
+    }
+
+    /// After output or a resize: the view back on the rows it showed. A switch
+    /// of screens (a program opening or closing the alternate one) ends copy mode.
+    /// History pruned from under the cursor or the view's top takes it to the oldest row.
+    fn hold_view(&mut self) {
+        let Some(copy) = &self.copy else { return };
+        if copy.alt != self.alt_screen() {
+            self.clear_copy_cursor();
+            return;
+        }
+        let (at, top) = (copy.at, copy.top);
+        if tracked_point(at, GHOSTTY_POINT_TAG_SCREEN).is_none()
+            && let Some(oldest) = self.track(0, 0)
+        {
+            unsafe { ghostty_tracked_grid_ref_free(at) };
+            if let Some(copy) = &mut self.copy {
+                copy.at = oldest;
+            }
+        }
+        let Some(top) = top else { return };
+        match tracked_point(top, GHOSTTY_POINT_TAG_SCREEN) {
+            Some(top) if u64::from(top.row) != self.scrollbar().offset => self.scroll_viewport_to(top.row as usize),
+            Some(_) => {}
+            None => {
+                self.scroll_viewport_to(0);
+                self.remember_top();
+            }
+        }
+    }
+
+    /// Up to `count` rows of the screen and history from `from`, as cells.
+    pub fn text_rows(&self, from: u32, count: u32) -> Vec<TextRow> {
+        let mut rows = Vec::new();
+        for y in from..from.saturating_add(count) {
+            let Some(mut r) = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, 0, y) else { break };
+            let mut cells = Vec::with_capacity(self.cols as usize);
+            for x in 0..self.cols {
+                r.x = x;
+                let mut wide: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW;
+                let mut cps = [0u32; 16];
+                let mut len = 0usize;
+                unsafe {
+                    let mut cell: GhosttyCell = Default::default();
+                    ghostty_grid_ref_cell(&r, &mut cell);
+                    ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &mut wide as *mut _ as *mut c_void);
+                    if wide != GHOSTTY_CELL_WIDE_SPACER_TAIL && wide != GHOSTTY_CELL_WIDE_SPACER_HEAD {
+                        ghostty_grid_ref_graphemes(&r, cps.as_mut_ptr(), cps.len(), &mut len);
+                    }
+                }
+                let text = cps[..len.min(cps.len())].iter().filter_map(|c| char::from_u32(*c)).collect();
+                cells.push(TextCell { text, wide: wide == GHOSTTY_CELL_WIDE_WIDE });
+            }
+            rows.push(TextRow { cells, wrapped: self.wraps(y) });
+        }
+        rows
     }
 
     /// Select the active screen and its history without formatting or copying text.
@@ -1369,6 +1532,7 @@ impl Vt {
         self.placements_cache.get_mut().take();
         self.win32.watch(bytes);
         unsafe { ghostty_terminal_vt_write(self.term, bytes.as_ptr(), bytes.len()) };
+        self.hold_view();
         self.feed_search();
     }
 
@@ -1389,6 +1553,7 @@ impl Vt {
         self.rows = rows;
         self.shared.size = GhosttySizeReportSize { rows, columns: cols, cell_width: cell_w.max(1), cell_height: cell_h.max(1) };
         unsafe { ghostty_terminal_resize(self.term, cols, rows, cell_w.max(1), cell_h.max(1)) };
+        self.hold_view();
         self.feed_search();
     }
 
@@ -1439,10 +1604,16 @@ impl Vt {
         s.value.delta = delta;
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
         self.feed_search();
+        self.remember_top();
     }
 
     /// Scrolls so `row` (from the scrollback's top) is the first visible row.
     pub fn scroll_to_row(&mut self, row: usize) {
+        self.scroll_viewport_to(row);
+        self.remember_top();
+    }
+
+    fn scroll_viewport_to(&mut self, row: usize) {
         self.placements_cache.get_mut().take();
         let mut s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_ROW, ..Default::default() };
         s.value.row = row;
@@ -1463,6 +1634,7 @@ impl Vt {
         let s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_BOTTOM, ..Default::default() };
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
         self.feed_search();
+        self.remember_top();
     }
 
     /// Start (or reuse) this terminal's Ghostty search. The handle belongs to
@@ -1628,6 +1800,7 @@ impl Vt {
         let s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_TOP, ..Default::default() };
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
         self.feed_search();
+        self.remember_top();
     }
 
     /// Wraps pasted text the way the program asked (bracketed paste or not).
@@ -1733,7 +1906,7 @@ impl Vt {
                         let mut row = Vec::with_capacity(self.cols as usize);
                         let mut x: u16 = 0;
                         while ghostty_render_state_row_cells_next(self.cells) {
-                            row.push(self.read_cell(fg_default, &colors.palette, selected && x >= sel.start_x && x <= sel.end_x));
+                            row.push(self.read_cell(fg_default, &colors.palette, selection, x));
                             x += 1;
                         }
                         Rc::new(row)
@@ -1758,7 +1931,19 @@ impl Vt {
                     _ => CursorShape::Block,
                 },
                 color: if colors.cursor_has_value { colors.cursor.into() } else { fg_default },
+                copy: false,
             });
+            // In copy mode its cursor stands in for the program's (hidden while scrolled away).
+            let cursor = match &self.copy {
+                Some(copy) => tracked_point(copy.at, GHOSTTY_POINT_TAG_VIEWPORT).map(|at| Cursor {
+                    x: at.col,
+                    y: at.row as u16,
+                    shape: CursorShape::Block,
+                    color: if colors.cursor_has_value { colors.cursor.into() } else { fg_default },
+                    copy: true,
+                }),
+                None => cursor,
+            };
 
             self.drawn = self.drawable();
             ghostty_render_state_clean(state);
@@ -1767,13 +1952,21 @@ impl Vt {
         }
     }
 
-    unsafe fn read_cell(&mut self, fg_default: Rgb, palette: &[GhosttyColorRgb; 256], selected: bool) -> Cell {
+    /// Reads cell `x` of the current row; `selection` is the row's selected
+    /// columns (inclusive). A wide character with either half selected is
+    /// highlighted whole, as it is copied whole.
+    unsafe fn read_cell(&mut self, fg_default: Rgb, palette: &[GhosttyColorRgb; 256], selection: Option<(u16, u16)>, x: u16) -> Cell {
         unsafe {
             let c = self.cells;
             let mut raw: GhosttyCell = Default::default();
             ghostty_render_state_row_cells_get(c, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &mut raw as *mut _ as *mut c_void);
             let mut wide: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW;
             ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &mut wide as *mut _ as *mut c_void);
+            let selected = selection.is_some_and(|(start, end)| {
+                (start..=end).contains(&x)
+                    || (wide == GHOSTTY_CELL_WIDE_WIDE && x + 1 == start)
+                    || (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL && x == end + 1)
+            });
 
             let mut style = GhosttyStyle { size: std::mem::size_of::<GhosttyStyle>(), ..Default::default() };
             ghostty_render_state_row_cells_get(c, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &mut style as *mut _ as *mut c_void);
@@ -1967,6 +2160,7 @@ impl Vt {
 
 impl Drop for Vt {
     fn drop(&mut self) {
+        self.clear_copy_cursor();
         unsafe {
             if let Some(search) = self.search {
                 ghostty_search_free(search);
@@ -2025,6 +2219,81 @@ mod tests {
         vt.clear_selection();
         assert_eq!(vt.selection_positions(), None);
         assert!(vt.adjust_selection("left").unwrap_err().contains("needs a selection"));
+    }
+
+    #[test]
+    fn a_copy_cursor_holds_the_view_and_its_text_while_output_arrives() {
+        let mut vt = Vt::new(20, 4);
+        for line in 0..10 {
+            vt.write(format!("line {line:02}\r\n").as_bytes());
+        }
+        // At the bottom the view follows output, so holding it is the point.
+        assert_eq!(vt.scrollbar().offset, 7);
+        vt.set_copy_cursor(Some(CellPosition { row: 8, col: 5 })).unwrap();
+        for line in 10..13 {
+            vt.write(format!("line {line:02}\r\n").as_bytes());
+        }
+        assert_eq!(vt.scrollbar().offset, 7, "the view stays on the rows it showed");
+        assert_eq!(vt.copy_cursor(), Some(CellPosition { row: 8, col: 5 }));
+        // A scroll asked for moves it; output after that keeps the new place.
+        vt.scroll_viewport(-2);
+        vt.write(b"line 13\r\n");
+        assert_eq!(vt.scrollbar().offset, 5);
+        let frame = vt.frame();
+        let cursor = frame.cursor.expect("the copy cursor shows");
+        assert!(cursor.copy);
+        assert_eq!((cursor.x, cursor.y), (5, 3));
+        vt.clear_copy_cursor();
+        assert_eq!(vt.copy_cursor(), None);
+        vt.write(b"line 14\r\n");
+        assert_eq!(vt.scrollbar().offset, 5, "without copy mode a scrolled view stays too");
+        vt.scroll_to_bottom();
+        vt.write(b"line 15\r\n");
+        assert_eq!(vt.scrollbar().offset + vt.scrollbar().len, vt.scrollbar().total, "and at the bottom it follows again");
+    }
+
+    #[test]
+    fn history_pruned_from_under_the_copy_cursor_takes_it_and_the_view_to_the_oldest_row() {
+        let mut vt = Vt::new(20, 4);
+        vt.write(b"first\r\nsecond\r\n");
+        vt.set_copy_cursor(Some(CellPosition { row: 0, col: 3 })).unwrap();
+        vt.scroll_viewport(-100);
+        let lines: String = (0..SCROLLBACK_MAX_LINES + 2000).map(|n| format!("{n}\r\n")).collect();
+        vt.write(lines.as_bytes());
+        assert_eq!(vt.copy_cursor(), Some(CellPosition { row: 0, col: 0 }));
+        assert_eq!(vt.scrollbar().offset, 0);
+        let rows = vt.text_rows(0, 1);
+        assert_ne!(rows[0].cells[0].text, "f", "the first rows are gone");
+    }
+
+    #[test]
+    fn copy_mode_reads_wide_cells_and_selects_blocks() {
+        let mut vt = Vt::new(10, 3);
+        vt.write("a日本\u{270d}\u{fe0f}\r\nbcdefgh\r\nijklmno".as_bytes());
+        let rows = vt.text_rows(0, 1);
+        let row = &rows[0];
+        let text: Vec<_> = row.cells.iter().take(7).map(|c| (c.text.as_str(), c.wide)).collect();
+        assert_eq!(text, [("a", false), ("日", true), ("", false), ("本", true), ("", false), ("\u{270d}\u{fe0f}", true), ("", false)]);
+        assert_eq!(vt.text_rows(1, 99).len(), 2);
+        // On the second half of a wide character, the cursor takes the whole character.
+        vt.set_copy_cursor(Some(CellPosition { row: 0, col: 2 })).unwrap();
+        assert_eq!(vt.copy_cursor(), Some(CellPosition { row: 0, col: 1 }));
+        vt.set_selection(CellPosition { row: 1, col: 1 }, CellPosition { row: 2, col: 3 }, true).unwrap();
+        assert_eq!(vt.selection_text().as_deref(), Some("cde\njkl"));
+        vt.set_selection(CellPosition { row: 1, col: 1 }, CellPosition { row: 2, col: 3 }, false).unwrap();
+        assert_eq!(vt.selection_text().as_deref(), Some("cdefgh\nijkl"));
+        // A block through the halves of wide characters copies them whole: they are highlighted whole.
+        let mut block = Vt::new(10, 2);
+        block.write("ab日本cd\r\n日本語xy".as_bytes());
+        block.set_selection(CellPosition { row: 0, col: 1 }, CellPosition { row: 1, col: 4 }, true).unwrap();
+        assert_eq!(block.selection_text().as_deref(), Some("b日本\n日本語"));
+        let frame = block.frame();
+        let lit = |row: usize| (0..10).filter(|&x| frame.rows[row][x].bg == Some(theme().selection_bg)).collect::<Vec<_>>();
+        assert_eq!((lit(0), lit(1)), ((1..=5).collect(), (0..=5).collect()));
+        assert!(vt.set_selection(CellPosition { row: 9, col: 0 }, CellPosition { row: 0, col: 0 }, false).is_err());
+        // A program switching screens ends copy mode: its cursor would point at the other screen.
+        vt.write(b"\x1b[?1049h");
+        assert_eq!(vt.copy_cursor(), None);
     }
 
     #[test]
